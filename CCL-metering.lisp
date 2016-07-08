@@ -41,7 +41,9 @@
 (defvar *TOTAL-OVERHEAD* 0
   "Total overhead so far.")
 (defvar *no-calls* nil
-  "A list of metered functions which weren't called.")
+  "A list of metered functions that weren't called. This is a global only for reporting convenience; when
+   it's too long to display with normal reporting results, the user can inspect the variable.")
+
 (defvar *estimated-total-overhead* 0)
 
 (defparameter *metering-table*
@@ -318,103 +320,12 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   (when (>= (parse-integer ccl::*openmcl-svn-revision* :junk-allowed t) 16532)
       (pushnew :atomicity *features*)))
       
-#-atomicity ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
-(defun meter-global-def (function-spec def &optional method-p)
-  (let ((stats (make-metering)))
-    (setf (get-metering-stats function-spec) stats)
-    (macrolet ((initial-lets (&body body)
-                 ; would be nice if this could be atomic
-                 `(let ((prev-total-time *total-time*)
-                        (prev-total-cons *total-cons*)
-                        (prev-total-calls *total-calls*)
-                        (start-time (get-time))
-                        (start-gctime (get-gctime))
-                        (start-cons (get-cons)))
-                    (declare (type unsigned-byte prev-total-time)
-                             (type unsigned-byte start-time)
-                             (type unsigned-byte prev-total-cons)
-                             (type unsigned-byte start-cons)
-                             (fixnum prev-total-calls))
-                    ,@body))
-               (post-tally ()
-                 ; would be nice if this could be atomic
-                 `(let ((delta-time (- (get-time) start-time (- (get-gctime) start-gctime)))
-                        (delta-cons (- (get-cons) start-cons))
-                        (metered-callee-time (- prev-total-time *total-time*)) ; always negative or 0
-                        (metered-callee-cons (- prev-total-cons *total-cons*)) ; always negative or 0
-                        )
-                    ;(format t "~%Delta-time: ~D" delta-time)
-                    ;(format t "~%Metered-callee-time: ~D" metered-callee-time)
-                    ; delta-time is the total elapsed time taken by body, which of course includes any time
-                    ;   taken by metered functions this body calls. Likewise with delta-cons.
-                    ;; Calls
-                    (incf (metering-calls stats))
-                    (incf *total-calls*)
-                    ;;; nested-calls includes this call
-                    (incf (metering-nested-calls stats) (the fixnum 
-                                                             (- *total-calls*
-                                                                prev-total-calls)))
-                    ;; Time
-                    ;;; Problem with inclusive time is that it
-                    ;;; currently doesn't add values from recursive
-                    ;;; calls to the same function. Change the
-                    ;;; setf to an incf to fix this?
-                    (incf (metering-inclusive-time stats) (the unsigned-byte delta-time))
-                    ;; At this point, *total-time* may be greater than prev-total-time, because
-                    ;;   it will have been incremented by any functions body calls. Must back that
-                    ;;   part out to accurately measure exclusive time.
-                    ;; Note that there's no way the increment here can be negative; delta-time
-                    ;;   MUST be greater than (- prev-total-time *total-time*) because everything measures
-                    ;;   total elapsed time. (Okay, it could be negative if a called
-                    ;;   metered function executes on a separate core.)
-                    (incf (metering-exclusive-time stats) (the unsigned-byte
-                                                               (+ delta-time
-                                                                  metered-callee-time
-                                                                  )))
-                    
-                    ; this is correct. If you just incremented *total-time*, the time of this body
-                    ;   and the time taken by metered functions it calls would be counted twice.
-                    (setf *total-time* (the unsigned-byte
-                                            (+ prev-total-time delta-time)))
-                    
-                    ;; Consing
-                    (incf (metering-inclusive-cons stats) (the unsigned-byte delta-cons))
-                    ;; Similar story as above for exclusive consing
-                    (incf (metering-exclusive-cons stats) (the unsigned-byte 
-                                                               (+ delta-cons
-                                                                  metered-callee-cons)))
-                    (setf *total-cons* (the unsigned-byte 
-                                            (+ prev-total-cons delta-cons)))
-                    
-                    ; by this time*, assume *total-overhead* has accurately accumulated the overhead of
-                    ;   metered functions called from body. Now we just have to add our own local overhead.
-                    ; *actually, by the time body has finished.
-                    (let ((my-overhead (the unsigned-byte
-                                            (- (get-time) 
-                                               start-time ; overall delta time for me and my local overhead
-                                               (- (get-gctime) start-gctime) ; any gc time that happened since last get-gctime
-                                               delta-time ; subtract out the non-overhead
-                                               ))))
-                      
-                      (incf *total-overhead* my-overhead)
-                      ; correct *total-time* to back out my overhead
-                      (decf *total-time* my-overhead)))))
-      (if method-p
-          (lambda (&method saved-method &rest arglist)
-            (declare (dynamic-extent arglist))
-            (initial-lets
-             (multiple-value-prog1 (apply-with-method-context saved-method
-                                                              (symbol-function def)
-                                                              arglist)
-               (post-tally))))
-          (lambda (&rest arglist)
-            (declare (dynamic-extent arglist))
-            (initial-lets
-             (multiple-value-prog1 (apply (symbol-function def) arglist)
-               (post-tally))
-             ))))))
+(defmacro maybe-atomic-incf (place delta)
+  #+atomicity
+  `(atomic-incf-decf ,place ,delta)
+  #-atomicity ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
+  `(incf ,place ,delta))
 
-#+atomicity
 (defun meter-global-def (function-spec def &optional method-p)
   (let ((stats (make-metering)))
     (setf (get-metering-stats function-spec) stats)
@@ -444,10 +355,10 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ; delta-time is the total elapsed time taken by body, which of course includes any time
                     ;   taken by metered functions this body calls. Likewise with delta-cons.
                     ;; Calls
-                    (atomic-incf (metering-calls stats))
-                    (atomic-incf *total-calls*)
+                    (maybe-atomic-incf (metering-calls stats) 1)
+                    (maybe-atomic-incf *total-calls* 1)
                     ;;; nested-calls includes this call
-                    (atomic-incf-decf (metering-nested-calls stats) (the fixnum 
+                    (maybe-atomic-incf (metering-nested-calls stats) (the fixnum 
                                                              (- *total-calls*
                                                                 prev-total-calls)))
                     ;; Time
@@ -455,7 +366,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;;; currently doesn't add values from recursive
                     ;;; calls to the same function. Change the
                     ;;; setf to an incf to fix this?
-                    (atomic-incf-decf (metering-inclusive-time stats) (the unsigned-byte delta-time))
+                    (maybe-atomic-incf (metering-inclusive-time stats) (the unsigned-byte delta-time))
                     ;; At this point, *total-time* may be greater than prev-total-time, because
                     ;;   it will have been incremented by any functions body calls. Must back that
                     ;;   part out to accurately measure exclusive time.
@@ -463,7 +374,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;;   MUST be greater than (- prev-total-time *total-time*) because everything measures
                     ;;   total elapsed time. (Okay, it could be negative if a called
                     ;;   metered function executes on a separate core.)
-                    (atomic-incf-decf (metering-exclusive-time stats) (the unsigned-byte
+                    (maybe-atomic-incf (metering-exclusive-time stats) (the unsigned-byte
                                                                (+ delta-time
                                                                   metered-callee-time
                                                                   )))
@@ -474,9 +385,9 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                                             (+ prev-total-time delta-time)))
                     
                     ;; Consing
-                    (atomic-incf-decf (metering-inclusive-cons stats) (the unsigned-byte delta-cons))
+                    (maybe-atomic-incf (metering-inclusive-cons stats) (the unsigned-byte delta-cons))
                     ;; Similar story as above for exclusive consing
-                    (atomic-incf-decf (metering-exclusive-cons stats) (the unsigned-byte 
+                    (maybe-atomic-incf (metering-exclusive-cons stats) (the unsigned-byte 
                                                                (+ delta-cons
                                                                   metered-callee-cons)))
                     (setf *total-cons* (the unsigned-byte 
@@ -492,9 +403,9 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                                                delta-time ; subtract out the non-overhead
                                                ))))
                       
-                      (atomic-incf-decf *total-overhead* my-overhead)
+                      (maybe-atomic-incf *total-overhead* my-overhead)
                       ; correct *total-time* to back out my overhead
-                      (atomic-incf-decf *total-time* (- my-overhead))))))
+                      (maybe-atomic-incf *total-time* (- my-overhead))))))
       (if method-p
           (lambda (&method saved-method &rest arglist)
             (declare (dynamic-extent arglist))
