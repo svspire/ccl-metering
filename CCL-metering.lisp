@@ -43,7 +43,7 @@
 
 (defvar *estimated-total-overhead* 0)
 
-(defparameter *metering-table*
+(defvar *metering-table*
   (make-hash-table :test #'equal))
 
 (defparameter metering-time-units-per-second 1000000)
