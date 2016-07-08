@@ -29,9 +29,6 @@
 (export '(meter unmeter meter* with-metering with-metering* report-metering reset-all-metering
           metered-functions meter-all meter-form))
 
-(defvar *meter-cons-overhead* 0
-  "The amount of cons an empty metered function costs.")
-
 (defvar *TOTAL-TIME* 0
   "Total amount of time metered so far.")
 (defvar *TOTAL-CONS* 0
