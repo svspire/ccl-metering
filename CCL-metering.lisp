@@ -1,31 +1,26 @@
 ;;; CCL-metering.lisp
 ;;; Shannon Spires
 
-;;; Tools for metering lisp functions and methods in CCL and MCL.
+;;; Tools for metering lisp functions and methods in CCL.
 ;;; Heavily cribbed from Mark Kantrowitz' metering.lisp. The user interface and
 ;;;   reporting formats are almost identical to that code, but this is a rewrite and independent of
 ;;;   it. The word "monitor" and its derivatives in the other code are "meter" etc. here.
 
 ;;; Also heavily cribbed from encapsulations.lisp from Digitool.
 
-;;; This is MCL/CCL-specific, where the MK version is not. I'm of the opinion that it's
-;;;   almost impossible to write truly portable, efficient metering code without it being
-;;;   a rat's nest of compile-time feature switches, because metering is inherently
-;;;   platform-specific. Thus this code is much simpler to read than MK's version.
+;;; This is CCL-specific, where the MK version is not.
 
 ;;; This code also has the very useful feature that it enables one to meter individual
-;;;   methods of a generic function separately, where MK's does not. My code uses methods
-;;;   heavily, and I often need to know which specific methods are taking the most time.
-;;;   Thus this feature. (Of course, metering regular functions is also still supported).
+;;;   methods of a generic function separately, where MK's does not.
+;;;   (Of course, metering regular functions is also still supported).
 
 ;;; This operates by essentially wrapping some advice around each metered method or function.
-;;; The function #'meter accepts the same syntax as #'advise except of course it takes fewer args
+;;; The function #'meter accepts the same syntax as #'advise except it takes fewer args
 ;;;   since it already knows precisely what extra work it needs to do before and after the nominal
 ;;;   function.
 ;;; The function #'meter* works just like #'meter except when you give it a symbol referring to a
 ;;;   generic function it automatically calls #'meter on all its methods.
-;;; The main user interface is #'with-metering, which accepts the same args as #'with-monitoring
-;;;   from the metering.lisp file.
+;;; The main user interface is #'with-metering.
 
 ;;; See examples at the end.
 
@@ -34,11 +29,6 @@
 (export '(meter unmeter meter* with-metering with-metering* report-metering reset-all-metering
           metered-functions meter-all meter-form))
 
-#+MCL
-(set-dispatch-macro-character #\# #\> (lambda (stream char count) (declare (ignore stream char count)) (values)))
-
-(defvar *meter-time-overhead* 0
-  "The amount of time an empty metered function costs, in metering-time-units-per-second")
 (defvar *meter-cons-overhead* 0
   "The amount of cons an empty metered function costs.")
 
@@ -57,21 +47,10 @@
 (defparameter *metering-table*
   (make-hash-table :test #'equal))
 
-
-;(defvar metering-time-units-per-second #+CCL-1.9 1000000000 #-CCL-1.9 1000000)
 (defparameter metering-time-units-per-second 1000000)
 (defparameter gc-time-conversion-factor (/ metering-time-units-per-second internal-time-units-per-second))
 
-#+MCL
-(defun microsecond-run-time ()
-  (declare (special ccl::*cme-microseconds*))
-  (rlet ((now :unsignedwide))
-    (#_MicroSeconds now)
-    (#_WideSubtract now ccl::*cme-microseconds*)
-    (ccl::unsignedwide->integer now)))
-
-; Can't use the one built in to CCL because its resolution is dependent on internal-time-units-per-second. This one is not.
-#+OPENMCL
+; Can't use %internal-run-time because its resolution is dependent on internal-time-units-per-second. This one is not.
 (defun %internal-microsecond-run-time ()
   ;; Returns user and system times in microseconds as multiple values.
   #-windows-target
@@ -100,10 +79,7 @@
            (convert 1))
       (values (floor user-100ns convert) (floor kernel-100ns convert)))))
 
-#+OPENMCL
 (defun microsecond-run-time ()
-  "Return the run time in the internal time format. (See
-  INTERNAL-TIME-UNITS-PER-SECOND.) This is useful for finding CPU usage."
   (multiple-value-bind (user sys) (%internal-microsecond-run-time)
     (+ user sys)))
 
@@ -269,23 +245,14 @@
                     end-of-column)
         (setf beginning-of-column end-of-column)))))
 
-;(defmacro get-time ()
-;    `(the unsigned-byte (get-internal-run-time)))
-
-; Note the bogosity here: Pre-CCL-1.9, we're measuring runtime. Post-CCL-1.9, we're measuring wall clock time.
-; FIXED.
-#+IGNORE ;#+(and openmcl ccl-1.9)
 (defmacro get-time ()
-  `(ccl:current-time-in-nanoseconds))
-
-;#-(and openmcl ccl-1.9)
-(defmacro get-time ()
-  `(microsecond-run-time))
+  `(the unsigned-byte (microsecond-run-time)))
 
 (defmacro get-gctime ()
-  (* gc-time-conversion-factor (gctime)))
+  `(* gc-time-conversion-factor (gctime)))
 
-(defmacro get-cons () `(the unsigned-byte (ccl::total-bytes-allocated)))
+(defmacro get-cons ()
+  `(the unsigned-byte (ccl::total-bytes-allocated)))
 
 (defun get-metering-stats (spec)
   (gethash spec *metering-table*))
@@ -293,82 +260,24 @@
 (defun (setf get-metering-stats) (value spec)
   (setf (gethash spec *metering-table*) value))
 
-
-#-MCL
 (defun %unmeter-all ()
   (unadvise t :when :meter :name :meter)
   (clrhash *metering-table*))
 
-#+MCL
-(defun %unmeter-all ()
-  (let (val)
-    (dolist (capsule *advise-alist*)
-      (when (eq :METER (encapsulation-advice-when capsule))
-        (push (list (encapsulation-spec capsule)
-                    (encapsulation-advice-when capsule)
-                    (encapsulation-advice-name capsule))
-              val)
-        (remove-encapsulation capsule)))
-     (clrhash *metering-table*) ; just a little extra insurance
-      val))
-
 ; (unmeter t) will remove all metering advice
-; (un t) will also remove all metering, as well as all other advice
+; (unadvise t) will also remove all metering, as well as all other advice
 
 (defun unmeter (function)
   (cond ((neq function t)
-         #+MCL
-         (unadvise-1 function :METER :METER)
-         #-MCL
-         (%unadvise-1 function :METER :METER)
-         )
+         (%unadvise-1 function :METER :METER))
         (t (%unmeter-all))))
-
-
-#+MCL
-(let ((*warn-if-redefine-kernel* nil))
-(defun remove-encapsulation (capsule &optional dont-replace)
-  ; optional don't replace is for unadvising, tracing all on a method
-  (let (spec nextsym newdef def)
-    (setf spec (encapsulation-owner capsule))
-    (setf def (typecase spec
-                (symbol (fboundp spec))
-                (method spec)))
-    (setf nextsym (encapsulation-symbol capsule))
-    (setf newdef (fboundp nextsym))
-    (without-interrupts
-     (if (standard-generic-function-p def)
-       (if (and (combined-method-p newdef)
-                (eq '%%call-encapsulated-gf (function-name (%combined-method-dcode newdef))))
-         (let* ((orig-decode (require-type (cdr (%combined-method-methods newdef)) 'function))
-                #+ppc-clos
-                (proto (cdr (assq orig-decode dcode-proto-alist)))
-                ) ; <<
-           (setf (%gf-dcode def) orig-decode)
-           #+ppc-clos
-           (setf (uvref def 0)(uvref (or proto *gf-proto*) 0)))
-         (setf (car (%combined-method-methods (%gf-dcode def))) newdef))
-       (typecase spec
-         (symbol (%fhave spec newdef))
-         (method (setf (%method-function spec) newdef)
-                 (remove-obsoleted-combined-methods spec)
-                 newdef)))
-     (put-encapsulation spec
-                        (if (null dont-replace)
-                          (function-encapsulation nextsym)))
-     (put-encapsulation nextsym nil)
-     (unrecord-encapsulation capsule)
-     (when (eq (encapsulation-advice-when capsule) :METER) ; SVS. Ensure this table gets cleaned out too.
-       (remhash (encapsulation-spec capsule) *metering-table*))
-     )))
-)
 
 #|
 New overhead strategy.
 Any given function must:
 
-Keep track of its own overhead, defined as the difference
-of its overall time minus its delta-time, where delta-time
+Keep track of its own overhead, defined as 
+its overall time minus its delta-time, where delta-time
 is the time taken by just its "meat".
 Call this "my-overhead." Add that to *total-overhead* at the END
 of the function.
@@ -395,7 +304,7 @@ Note about atomic-incf and atomic-decf below.
 If a given function is being metered in more than one thread simultaneously, it's important to increment and decrement
 metering counts atomically. Otherwise, incorrect counts can result.
 
- It would be even better to lock the entire stats structure during the execution of meter-global-def,
+It would be even better to lock the entire stats structure during the execution of meter-global-def,
 but that would require a lock and waiting for locks inside metering code seems like a very bad idea.
 In most metering scenarios, a lack of consistency between elements of a given stats struct is probably not a big deal, because
 you shouldn't be checking a given stats structure until all metering uses of it are done and you're reporting the results. By
@@ -415,9 +324,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
     (setf (get-metering-stats function-spec) stats)
     (macrolet ((initial-lets (&body body)
                  ; would be nice if this could be atomic
-                 `(let (;(overhead-start-time (get-time)) ;assume this is close enough to start-time to just use that
-                        (prev-total-overhead *total-overhead*)
-                        (prev-total-time *total-time*)
+                 `(let ((prev-total-time *total-time*)
                         (prev-total-cons *total-cons*)
                         (prev-total-calls *total-calls*)
                         (start-time (get-time))
@@ -513,9 +420,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
     (setf (get-metering-stats function-spec) stats)
     (macrolet ((initial-lets (&body body)
                  ; would be nice if this could be atomic
-                 `(let (;(overhead-start-time (get-time)) ;assume this is close enough to start-time to just use that
-                        (prev-total-overhead *total-overhead*)
-                        (prev-total-time *total-time*)
+                 `(let ((prev-total-time *total-time*)
                         (prev-total-cons *total-cons*)
                         (prev-total-calls *total-calls*)
                         (start-time (get-time))
@@ -646,20 +551,11 @@ It's still likely that *total-time* and overhead calculations will be bogus here
       (advise-2 newdef newsym method-p function :meter :meter ; when and name are :meter
                  define-if-not)))
 
-#-MCL-COMMON-MOP-SUBSET
-(defun pretty-class-name (method-specializer)
-  (if (listp method-specializer)
-    method-specializer
-    (class-name method-specializer)))
-
-
-#-MCL
 (defun uncanonicalize-specializer (specializer)
   (etypecase specializer
     (class (class-name specializer))
     (eql-specializer (list 'eql (eql-specializer-object specializer)))))
 
-#+MCL-COMMON-MOP-SUBSET
 (defun pretty-class-name (method-specializer)
   (uncanonicalize-specializer method-specializer))
 
@@ -671,13 +567,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
             ))
 
 (defun get-methods (generic-function)
-  (let ((all-methods (generic-function-methods generic-function)))
-    #-MCL-COMMON-MOP-SUBSET
-    (setf all-methods ; because accessors cannot be encapsulated in pre-MOP MCL
-          (remove-if #'(lambda (method)
-                         (typep method 'standard-accessor-method))
-                     all-methods))
-    all-methods))
+  (generic-function-methods generic-function))
 
 (defun meter* (function &key define-if-not)
   "Like meter but if function is a GF, it meters all its methods extant at the time and
@@ -692,8 +582,6 @@ It's still likely that *total-time* and overhead calculations will be bogus here
          results))
       (meter function :define-if-not define-if-not))))
 
-; (trace ccl::METER-INFO-VALUES) to see if any values being returned are negative
-
 (defun meter-info-values (spec &optional (nested :exclusive))
   "Returns metering information values for the specified function,
    adjusted for overhead."
@@ -704,17 +592,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
       (case nested
         (:exclusive (values (metering-calls stats)
                             (metering-nested-calls stats)
-                            
-                            #+BOGUS ; too often, this returns a negative number. Bag the whole overhead thing.
-                            (- (metering-exclusive-time stats)
-                               (* (metering-calls stats) *meter-time-overhead*))
-                            #-BOGUS
                             (metering-exclusive-time stats)
-
-                            #+BOGUS ; too often, this returns a negative number. Bag the whole overhead thing.
-                            (- (metering-exclusive-cons stats)
-                               (* (metering-calls stats) *meter-cons-overhead*))
-                            #-BOGUS
                             (metering-exclusive-cons stats)
                             ))
         ;; Nested-calls includes the
@@ -722,16 +600,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
         ;; functions which call themselves recursively.]
         (:inclusive (values (metering-calls stats)
                             (metering-nested-calls stats)
-                            #+BOGUS ; too often, this returns a negative number. Bag the whole overhead thing.
-                            (- (metering-inclusive-time stats)
-                               (* (metering-nested-calls stats) *meter-time-overhead*))
-                            #-BOGUS
                             (metering-inclusive-time stats)
-
-                            #+BOGUS ; too often, this returns a negative number. Bag the whole overhead thing.
-                            (- (metering-inclusive-cons stats)
-                               (* (metering-nested-calls stats) *meter-cons-overhead*))
-                            #-BOGUS
                             (metering-inclusive-cons stats)
                             )))
       (values 0 0 0 0))))
@@ -765,10 +634,6 @@ It's still likely that *total-time* and overhead calculations will be bogus here
           (incf total-time time)
           (incf total-cons cons)))
       ;; Total overhead.
-      #+ignore
-      (setf *estimated-total-overhead*        
-            (/ (* *meter-time-overhead* total-calls)
-               metering-time-units-per-second))
       (setf *estimated-total-overhead*        
             (/ *total-overhead*
                metering-time-units-per-second))
@@ -869,56 +734,6 @@ It's still likely that *total-time* and overhead calculations will be bogus here
          (report-metering :all ,nested ,threshold ,key)))
      (unmeter t)))
 
-
-;;; ********************************
-;;; Overhead Calculations **********
-;;; ********************************
-(defparameter overhead-iterations2 100000
-  "Number of iterations over which the timing overhead is averaged.")
-
-(proclaim '(notinline stub-function))
-(defun STUB-FUNCTION (x)
-  (declare (integer x) (optimize (safety 3) (speed 0) (debug 3)))
-  (* x (+ x (random (1+ x)))))
-
-(defun set-meter-overhead ()
-  "Determines the average overhead of metering by metering the execution
-  of an empty function many times." 
-  (flet ((run-stub ()
-           (without-interrupts
-             (dotimes (x overhead-iterations2)
-               (stub-function (random 100))) ; hope this will prevent the compiler from omitting this loop
-             )))
-    (let ((unmetered-time (get-time))
-          (metered-time nil))
-      (run-stub)
-      (setf unmetered-time (- (get-time) unmetered-time))
-      (setf *meter-time-overhead* 0
-            *meter-cons-overhead* 0)
-      (stub-function 10)
-      (meter 'stub-function)
-      (reset-all-metering)
-      (setf metered-time (get-time))
-      (run-stub)
-      (setf metered-time (- (get-time) metered-time))
-      (let ((fiter (float overhead-iterations2)))
-        (multiple-value-bind (calls nested-calls time cons)
-                             (meter-info-values 'stub-function)
-          (declare (ignore nested-calls))
-          (unless (= calls overhead-iterations2)
-            (error "Something's wrong. Is it possible that another thread is running #'set-meter-overhead?"))
-          (format t "~%Unmetered-time: ~S" unmetered-time)
-          (format t "~%Time measured by advise: ~S. Time measured crudely: ~S." time metered-time)
-          (setf *meter-time-overhead* ;(/ (- metered-time unmetered-time) fiter) ; wrong.
-                (/ time fiter) ; yes, this IS the correct way to do this. Just accounts for what metering infrastructure thinks time is vs what it is without metering infrastructure
-                *meter-cons-overhead* (/ cons fiter)))
-        (unmeter 'stub-function)
-        *meter-time-overhead*))))
-
-#+IGNORE ; no longer using *meter-time-overhead*
-(eval-when (:load-toplevel :execute)
-  (set-meter-overhead))
-
 (defun sort-results (metering-results &optional (key :percent-time))
   (case key
     (:function             (stable-sort metering-results #'string>
@@ -974,28 +789,10 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 
 ;;; EXAMPLES
 #|
-#-MCL
 (with-metering (directory %path-cat %path-std-quotes  %unix-file-kind  ftd-ff-call-expand-function
                            %ff-call  get-foreign-namestring  %read-dir  %new-directory-p  %open-dir
                            %file*= %split-dir  %add-directory-result  %all-directories %stat
                            %directory %files-in-directory %some-specific %one-wild %process-directory-result)
                           (:exclusive 0.0)
                           (length (directory "ccl:**;*" :files t :directories nil :follow-links nil :include-emacs-lockfiles t)))
-
-#+MCL
-(with-metering (directory %directory2 %path-std-quotes 
-                          path-to-fsref
-                          %all-directories2
-                          %split-dir
-                          maybe-resolve-alias
-                          get-fsref-name-tail-ustr
-                          does-pattern-match-ustr
-                          %dir-sub-dir2
-                          %dir-sub-file2
-                          string-from-hfsunistr
-                          quote-some-chars-in-hfsunistr
-                          do-name-and-type-match-ustr
-                          %files-in-directory2 %some-specific2 %one-wild2)
-                          (:exclusive 0.0)
-                          (length (directory "ccl:**;*" :files t :directories nil)))
 |#
