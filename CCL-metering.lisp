@@ -109,7 +109,7 @@
 (defstruct (metering-column
             (:conc-name m-column-)
             (:constructor make-metering-column (header value-getter formatter justify totalize)))
-  header ; string or list of strings. If the latter, each will be on a different line.
+  header ; string or list of strings. If the latter, each will be on a separate line.
   value-getter
   formatter ; for values
   justify ; :left, :center, or :right
@@ -139,9 +139,9 @@
 
 (defun get-max-width-of-header (column)
   (let ((header (m-column-header column)))
-    (if (listp header)
-      (reduce 'max header :key 'length)
-      (length header))))
+    (etypecase header
+      (cons   (reduce 'max header :key 'length))
+      (string (length header)))))
 
 (defun get-max-width (results filter column)
   "Returns the maximum width of all the values in this column, including the column header and final total, if any.
