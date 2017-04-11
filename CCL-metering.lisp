@@ -314,7 +314,9 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 
 ; Only svn versions 16532 and later have atomic-incf functions fixed to work with structure refs
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (when (>= (parse-integer ccl::*openmcl-svn-revision* :junk-allowed t) 16532)
+  (when (or (and (>= *openmcl-major-version* 1) ; git versions
+                 (>= *openmcl-minor-version* 12))
+         (>= (parse-integer ccl::*openmcl-svn-revision* :junk-allowed t) 16532))
       (pushnew :atomicity *features*)))
       
 (defmacro maybe-atomic-incf (place delta)
