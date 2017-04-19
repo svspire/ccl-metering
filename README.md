@@ -15,10 +15,10 @@ The function #'meter* works just like #'meter except when you give it a symbol r
 The main user interface is #'with-metering.
 
 # EXAMPLE
-
+    (in-package :ccl)
     (with-metering (directory %path-cat %path-std-quotes  %unix-file-kind  ftd-ff-call-expand-function
                            %ff-call  get-foreign-namestring  %read-dir  %new-directory-p  %open-dir
                            %file*= %split-dir  %add-directory-result  %all-directories %stat
-                           %directory %files-in-directory %some-specific %one-wild %process-directory result)
+                           %directory %files-in-directory %some-specific %one-wild %process-directory-result)
                           (:exclusive 0.0)
                           (length (directory "ccl:**;*" :files t :directories nil :follow-links nil :include-emacs-lockfiles t)))
