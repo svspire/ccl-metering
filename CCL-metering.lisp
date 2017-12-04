@@ -313,12 +313,16 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 |#
 
 ; Only svn versions 16532 and later have atomic-incf functions fixed to work with structure refs
+;  Except release 1.11.5 omitted that patch. So test for the functionality itself.
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (when (or (and (>= *openmcl-major-version* 1) ; git versions
-                 (>= *openmcl-minor-version* 12))
-         (>= (parse-integer ccl::*openmcl-svn-revision* :junk-allowed t) 16532))
-      (pushnew :atomicity *features*)))
-      
+  (defstruct (foostruct)
+    (slot1 0))
+  (let ((foo (make-foostruct)))
+    (declare (ignore-if-unused foo))
+    (ignore-errors
+     (macroexpand `(atomic-incf-decf (foostruct-slot1 foo) 1))
+     (pushnew :atomicity *features*))))
+
 (defmacro maybe-atomic-incf (place delta)
   #+atomicity
   `(atomic-incf-decf ,place ,delta)
@@ -355,7 +359,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;   taken by metered functions this body calls. Likewise with delta-cons.
                     ;; Calls
                     (maybe-atomic-incf (metering-calls stats) 1)
-                    (maybe-atomic-incf *total-calls* 1)
+                    (atomic-incf-decf *total-calls* 1)
                     ;;; nested-calls includes this call
                     (maybe-atomic-incf (metering-nested-calls stats) (the fixnum 
                                                              (- *total-calls*
@@ -402,9 +406,9 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                                                delta-time ; subtract out the non-overhead
                                                ))))
                       
-                      (maybe-atomic-incf *total-overhead* my-overhead)
+                      (atomic-incf-decf *total-overhead* my-overhead)
                       ; correct *total-time* to back out my overhead
-                      (maybe-atomic-incf *total-time* (- my-overhead))))))
+                      (atomic-incf-decf *total-time* (- my-overhead))))))
       (if method-p
           (lambda (&method saved-method &rest arglist)
             (declare (dynamic-extent arglist))
