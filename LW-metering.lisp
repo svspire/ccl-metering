@@ -32,13 +32,16 @@
   "Total amount of consing metered so far.")
 (defvar *TOTAL-CALLS* 0
   "Total number of calls metered so far.")
-(defvar *TOTAL-OVERHEAD* 0
-  "Total overhead so far.")
+(defvar *TOTAL-CPU-OVERHEAD* 0
+  "Total CPU time overhead so far.")
+(defvar *TOTAL-CONS-OVERHEAD* 0
+  "Total consing overhead so far.")
+
 (defvar *no-calls* nil
   "A list of metered functions that weren't called. This is a global only for reporting convenience; when
    it's too long to display with normal reporting results, the user can inspect the variable.")
 
-(defvar *estimated-total-overhead* 0)
+(defvar *estimated-total-cpu-overhead* 0 "Estimated metering overhead of CPU time in seconds")
 
 (defvar *metering-table*
   (make-hash-table :test #'equal))
@@ -292,7 +295,7 @@
 (defmacro get-wall-time () ; wall clock time in case we need it
   `(the unsigned-byte (get-wall-time-usec)))
 
-#+LISPWORKS
+#|#+LISPWORKS ; note this allocates 25104 bytes per call!!
 (defmacro get-cpu-time ()
   `(the unsigned-byte
         (let ((times (system::get-cpu-times)))
@@ -300,7 +303,19 @@
              (slot-value times 'system::user-micros)
              (* 1000000 (slot-value times 'system::system-secs))
              (slot-value times 'system::system-micros)))))
-    
+|#  
+  
+#+LISPWORKS ; this only allocates 992 bytes per call
+(defmacro get-cpu-time ()
+  ; note that adding declarations makes this cons more!
+  `(the unsigned-byte
+        (let ((times (system::get-cpu-times)))
+          (declare (dynamic-extent times))
+          (+ (* 1000000 (+ (slot-value times 'system::user-secs)
+                           (slot-value times 'system::system-secs)))
+             (slot-value times 'system::user-micros)
+             (slot-value times 'system::system-micros)))))
+
 #+CCL
 (defmacro get-gctime ()
   `(* gc-time-conversion-factor (gctime)))
@@ -315,9 +330,16 @@
 (defmacro get-cons ()
   `(the unsigned-byte (ccl::total-bytes-allocated)))
 
+#|#+LISPWORKS
+(defmacro get-cons ()
+  (getf (() :TOTAL-ALLOCATED)) ; this conses a lot which kinda defeats the purpose
+|#
+
 #+LISPWORKS
 (defmacro get-cons ()
-  (getf (system::room-values) :TOTAL-ALLOCATED))
+  ; This reports numbers that are much too high compared to what #'time reports.
+  ;  This is why I write the "bogus" comment in the report when Lispworks is running. Need help from Martin Simmons to figure this out.
+  (nth-value 1 (RAW::INTERNAL-ROOM)))
 
 (defun get-metering-stats (spec)
   (gethash spec *metering-table*))
@@ -360,14 +382,14 @@ Any given function must:
 Keep track of its own overhead, defined as 
 its overall time minus its delta-time, where delta-time
 is the time taken by just its "meat".
-Call this "my-overhead." Add that to *total-overhead* at the END
+Call this "my-cpu-overhead." Add that to *total-cpu-overhead* at the END
 of the function.
 
 Of course delta-time includes the overhead of CALLED metered
 functions too, but we don't care about this, because we will
 have already subtracted out ALL of delta-time in our overhead
 calculations. (The called metered functions will have appropriately
-incremented *total-overhead* themselves, by the time we get
+incremented *total-cpu-overhead* themselves, by the time we get
 to the end of ourself.)
 
 Note that we do NOT need to remove overhead of CALLED metered functions
@@ -376,8 +398,17 @@ updated by our callees to NOT include their own overhead.
 
 To make this assumption true, we back out our own overhead from our own
 updating of *total-time* and thus the assumption becomes true by induction.
+UPDATE 03-Jan-2024
+Above sentence is wrong. We _must not_ back out "our own overhead" from our own
+updating of *total-time* because _it has already been backed out_. When we update
+*total-time*, it's merely incremented by delta-time, which itself includes no 
+metering overhead (or at least as little overhead as possible). If we explicitly subtract
+my-cpu-overhead from *total-time*, we're subtracting overhead _twice_ which can in some
+cases make *total-time* become _negative_ at the end of a metered function. At the
+very least, this practice will artificially inflate caller time and artificially
+decrease callee time.
 
-We really need to do all the above for consing-overhead too, but that will come later.
+We also do all the above for consing-overhead.
 |#
 
 #|
@@ -436,7 +467,8 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                              (type unsigned-byte start-time)
                              (type unsigned-byte prev-total-cons)
                              (type unsigned-byte start-cons)
-                             (fixnum prev-total-calls))
+                             (fixnum prev-total-calls)
+                             (dynamic-extent prev-total-time start-time prev-total-cons start-cons prev-total-calls))
                     ,@body))
                (post-tally ()
                  ; would be nice if this could be atomic
@@ -445,6 +477,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                         (metered-callee-time (- prev-total-time *total-time*)) ; always negative or 0
                         (metered-callee-cons (- prev-total-cons *total-cons*)) ; always negative or 0
                         )
+                    (declare (dynamic-extent delta-time delta-cons metered-callee-time metered-callee-cons))
                     (when (< delta-time 0) (error "delta-time shouldn't be negative"))
                     ;(format t "~%~S. Delta-time: ~D" function-spec delta-time)
                     ;(format t "~%~S. Metered-callee-time: ~D" function-spec metered-callee-time)
@@ -494,20 +527,25 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     (setf *total-cons* (the unsigned-byte 
                                             (+ prev-total-cons delta-cons)))
                     
-                    ; by this time*, assume *total-overhead* has accurately accumulated the overhead of
+                    ; by this time*, assume *total-cpu-overhead* has accurately accumulated the overhead of
                     ;   metered functions called from body. Now we just have to add our own local overhead.
                     ; *actually, by the time body has finished.
-                    (let ((my-overhead (the unsigned-byte
+                    (let ((my-cpu-overhead (the unsigned-byte
                                             (- (get-cpu-time) 
                                                start-time ; overall delta time for me and my local overhead
                                                (- (get-gctime) start-gctime) ; any gc time that happened since last get-gctime
                                                delta-time ; subtract out the non-overhead
-                                               ))))
-                      (when (< my-overhead 0) (error "My-overhead is negative."))
-                      (maybe-atomic-incf *total-overhead* my-overhead)
+                                               )))
+                          (my-cons-overhead (the unsigned-byte
+                                                 (- (get-cons)
+                                                    start-cons ; overall delta cons for me and my local overhead
+                                                    delta-cons)))) ; subtract out the non-overhead
+                      ;(when (< my-cpu-overhead 0) (error "My-cpu-overhead is negative."))
+                      (maybe-atomic-incf *total-cpu-overhead* my-cpu-overhead)
+                      (maybe-atomic-incf *total-cons-overhead* my-cons-overhead)
                       ; correct *total-time* to back out my overhead
                       ;;; NO!!! *total-time* already has overhead backed out. If you do this, you're backing it out a second time.
-                      ;(maybe-atomic-incf *total-time* (- my-overhead))
+                      ;(maybe-atomic-incf *total-time* (- my-cpu-overhead))
                     ))))
       (if method-p
           (lambda (&method saved-method &rest arglist)
@@ -548,7 +586,8 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   (setf *total-time* 0
         *total-cons* 0
         *total-calls* 0
-        *total-overhead* 0)
+        *total-cpu-overhead* 0
+        *total-cons-overhead* 0)
   (maphash #'(lambda (spec stats)
                (declare (ignore spec))
                (%reset-metering-info stats))
@@ -668,8 +707,8 @@ It's still likely that *total-time* and overhead calculations will be bogus here
           (incf total-time time)
           (incf total-cons cons)))
       ;; Total overhead.
-      (setf *estimated-total-overhead*        
-            (/ *total-overhead*
+      (setf *estimated-total-cpu-overhead*        
+            (/ *total-cpu-overhead*
                metering-time-units-per-second))
       ;; Assemble data for only the specified specs (all metered functions)
       (if (zerop total-time)
@@ -805,8 +844,14 @@ It's still likely that *total-time* and overhead calculations will be bogus here
     (format *trace-output* "~%")
     (print-column-trailers *trace-output* column-instances)
     (format *trace-output*
-            "~%Estimated total metering overhead: ~F seconds"
-            *estimated-total-overhead*)
+            "~%Estimated total metering CPU overhead: ~F seconds"
+            *estimated-total-cpu-overhead*)
+    (format *trace-output*
+            "~%Estimated total metering cons overhead: ~D bytes"
+            *total-cons-overhead*)
+    #+LISPWORKS
+    (format *trace-output*
+            "~%(Note that consing numbers in Lispworks are probably bogus.)")
     (when (and (not ignore-no-calls) *no-calls*)
       (setf *no-calls* (sort *no-calls* #'string<))
       (let ((num-no-calls (length *no-calls*)))
