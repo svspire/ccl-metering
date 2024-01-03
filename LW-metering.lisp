@@ -1,9 +1,7 @@
 ;;; LW-metering.lisp
 ;;; Shannon Spires 08-Mar-2022
 
-;;; FAILED EXPERIMENT. Or rather, unfinished. I found it easier just to use 
-;;;   https://gitlab.common-lisp.net/dkochmanski/metering.
-;;;   See #P"with-metering for lispworks.txt"
+;;;   Also see https://gitlab.common-lisp.net/dkochmanski/metering.
 
 ;;; Tools for metering lisp functions and methods in Lispworks. (Should still work in CCL too.)
 ;;; NOTE: This records wall-clock time in microseconds, while the CCL version records CPU time in microseconds.
@@ -23,7 +21,7 @@
 
 ;;; See examples at the end.
 
-(in-package :ccl)
+(in-package #+CCL :ccl #-CCL :cl-user)
 
 (export '(meter unmeter meter* with-metering with-metering* report-metering reset-all-metering
           metered-functions meter-all meter-form))
@@ -48,6 +46,8 @@
 (defparameter metering-time-units-per-second 1000000)
 (defparameter gc-time-conversion-factor (/ metering-time-units-per-second internal-time-units-per-second))
 
+;;; NB: This is wall clock time! It's not comparable to %internal-microsecond-run-time!
+;;; From David McClain, who may have gotten it from https://gitlab.common-lisp.net/dkochmanski/metering
 #+(AND :LISPWORKS (OR :LINUX :MACOSX))
 (PROGN
  (fli:define-foreign-function (_get-time-of-day "gettimeofday" :source)
@@ -55,7 +55,7 @@
      (tzinfo :pointer))
    :result-type :long)
 
- (defun get-time-usec ()
+ (defun get-wall-time-usec ()
    ;; time since midnight Jan 1, 1970, measured in microseconds
    (fli:with-dynamic-foreign-objects ()
 	(let ((arr (fli:allocate-dynamic-foreign-object
@@ -68,10 +68,28 @@
            (error "Can't perform Posix gettimeofday()"))
 	 ))))
 
+#-CCL ; do nothing with #> sequences
+(set-dispatch-macro-character
+ #\# #\>
+ (lambda (stream char arg)
+    (declare (ignore char arg))
+      (progn
+        (read stream nil nil nil)
+        nil)))
+
+#-CCL ; do nothing with #_ sequences
+(set-dispatch-macro-character
+ #\# #\_
+ (lambda (stream char arg)
+    (declare (ignore char arg))
+      (progn
+        (read stream nil nil nil)
+        nil)))
+
 ; Can't use %internal-run-time because its resolution is dependent on internal-time-units-per-second. This one is not.
 #+CCL
 (defun %internal-microsecond-run-time ()
-  ;; Returns user and system times in microseconds as multiple values.
+  ;; Returns user and system times in microseconds as multiple values. This is strictly CPU time, not wall clock time.
   #-windows-target
   (rlet ((usage :rusage))
     (%%rusage usage)
@@ -265,29 +283,41 @@
                     end-of-column)
         (setf beginning-of-column end-of-column)))))
 
+; #'get-cpu-time returns total CPU runtime (system+user) in microseconds
 #+CCL
-(defmacro get-time ()
+(defmacro get-cpu-time ()
   `(the unsigned-byte (microsecond-run-time)))
 
 #+LISPWORKS
-(defmacro get-time ()
-  `(the unsigned-byte (get-time-usec)))
+(defmacro get-wall-time () ; wall clock time in case we need it
+  `(the unsigned-byte (get-wall-time-usec)))
 
+#+LISPWORKS
+(defmacro get-cpu-time ()
+  `(the unsigned-byte
+        (let ((times (system::get-cpu-times)))
+          (+ (* 1000000 (slot-value times 'system::user-secs))
+             (slot-value times 'system::user-micros)
+             (* 1000000 (slot-value times 'system::system-secs))
+             (slot-value times 'system::system-micros)))))
+    
 #+CCL
 (defmacro get-gctime ()
   `(* gc-time-conversion-factor (gctime)))
 
-#+LISPWORKS ; not done yet
+#+LISPWORKS ; only valid after #'hcl::start-gc-timing has been called and before #'hcl::stop-gc-timing has been called.
 (defmacro get-gctime ()
+  ;;;(truncate (* 1000000 (getf (hcl::get-gc-timing) :total))) ;;; NDY this appears to be wall clock time and thus cannot be compared with cpu time
   0)
+  
 
 #+CCL
 (defmacro get-cons ()
   `(the unsigned-byte (ccl::total-bytes-allocated)))
 
-#+LISPWORKS ; not done yet
+#+LISPWORKS
 (defmacro get-cons ()
-  0)
+  (getf (system::room-values) :TOTAL-ALLOCATED))
 
 (defun get-metering-stats (spec)
   (gethash spec *metering-table*))
@@ -298,19 +328,29 @@
 #+CCL
 (defun %unmeter-all ()
   (unadvise t :when :meter :name :meter)
+  ; (unadvise t) [without other qualifiers] will remove all metering as well as all other advice
   (clrhash *metering-table*))
 
-#-CCL
+#+LISPWORKS
 (defun %unmeter-all ()
-  (unadvise t :when :meter :name :meter)
+  (hcl::stop-gc-timing)
+  (let ((specs (metered-functions)))
+    (dolist (spec specs)
+      (lw:remove-advice spec :METER)))
   (clrhash *metering-table*))
 
-; (unmeter t) will remove all metering advice
-; (unadvise t) will also remove all metering, as well as all other advice
-
+#+CCL
 (defun unmeter (function)
+  "(unmeter t) will remove all metering advice"
   (cond ((neq function t)
          (%unadvise-1 function :METER :METER))
+        (t (%unmeter-all))))
+
+#+LISPWORKS
+(defun unmeter (function)
+  "(unmeter t) will remove all metering advice"
+  (cond ((not (eq function t))
+         (lw:remove-advice function :METER))
         (t (%unmeter-all))))
 
 #|
@@ -357,7 +397,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 ; Only svn versions 16532 and later have atomic-incf functions fixed to work with structure refs
 ;  Except release 1.11.5 omitted that patch. So test for the functionality itself.
 
-#+CCL ; don't know how to do atomicity in Lispworks (yet)
+#+CCL
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defstruct (foostruct)
     (slot1 0))
@@ -367,14 +407,17 @@ It's still likely that *total-time* and overhead calculations will be bogus here
      (macroexpand `(atomic-incf-decf (foostruct-slot1 foo) 1))
      (pushnew :atomicity *features*))))
 
-#-CCL
-(defmacro apply-with-method-context (%rest args)
+#+LISPWORKS
+(defmacro apply-with-method-context (&rest args)
+  "Do nothing but don't error if this fn is encountered by the compiler."
   )
 
 (defmacro maybe-atomic-incf (place delta)
-  #+atomicity
+  #+(and CCL atomicity)
   `(atomic-incf-decf ,place ,delta)
-  #-atomicity ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
+  #+LISPWORKS
+  `(sys:atomic-incf ,place ,delta)
+  #-(or (and CCL atomicity) LISPWORKS) ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
   `(incf ,place ,delta))
 
 (defun meter-global-def (function-spec def &optional method-p)
@@ -386,7 +429,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                  `(let ((prev-total-time *total-time*)
                         (prev-total-cons *total-cons*)
                         (prev-total-calls *total-calls*)
-                        (start-time (get-time))
+                        (start-time (get-cpu-time))
                         (start-gctime (get-gctime))
                         (start-cons (get-cons)))
                     (declare (type unsigned-byte prev-total-time)
@@ -397,13 +440,16 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ,@body))
                (post-tally ()
                  ; would be nice if this could be atomic
-                 `(let ((delta-time (- (get-time) start-time (- (get-gctime) start-gctime)))
+                 `(let ((delta-time (- (get-cpu-time) start-time (- (get-gctime) start-gctime)))
                         (delta-cons (- (get-cons) start-cons))
                         (metered-callee-time (- prev-total-time *total-time*)) ; always negative or 0
                         (metered-callee-cons (- prev-total-cons *total-cons*)) ; always negative or 0
                         )
-                    ;(format t "~%Delta-time: ~D" delta-time)
-                    ;(format t "~%Metered-callee-time: ~D" metered-callee-time)
+                    (when (< delta-time 0) (error "delta-time shouldn't be negative"))
+                    ;(format t "~%~S. Delta-time: ~D" function-spec delta-time)
+                    ;(format t "~%~S. Metered-callee-time: ~D" function-spec metered-callee-time)
+                    ;(format t "~%~S. Delta-cons: ~D" function-spec delta-cons)
+                    ;(format t "~%~S. Metered-callee-cons: ~D" function-spec metered-callee-cons)
                     ; delta-time is the total elapsed time taken by body, which of course includes any time
                     ;   taken by metered functions this body calls. Likewise with delta-cons.
                     ;; Calls
@@ -411,8 +457,8 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     (maybe-atomic-incf *total-calls* 1)
                     ;;; nested-calls includes this call
                     (maybe-atomic-incf (metering-nested-calls stats) (the fixnum 
-                                                             (- *total-calls*
-                                                                prev-total-calls)))
+                                                                          (- *total-calls*
+                                                                             prev-total-calls)))
                     ;; Time
                     ;;; Problem with inclusive time is that it
                     ;;; currently doesn't add values from recursive
@@ -420,28 +466,31 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;;; setf to an incf to fix this?
                     (maybe-atomic-incf (metering-inclusive-time stats) (the unsigned-byte delta-time))
                     ;; At this point, *total-time* may be greater than prev-total-time, because
-                    ;;   it will have been incremented by any functions body calls. Must back that
-                    ;;   part out to accurately measure exclusive time.
+                    ;;   it will have been incremented by any metered functions body calls. (But only the 
+                    ;;   _shallowest_ metered functions (in the stack depth sense) will affect the *total-time*
+                    ;;   we can see here. Any effects on *total-time* at deeper levels will have been erased
+                    ;;   before we can see them in the context of this code you're reading right here.
+                    ;;   Anyway we must back that part out to accurately measure exclusive time.
                     ;; Note that there's no way the increment here can be negative; delta-time
                     ;;   MUST be greater than (- prev-total-time *total-time*) because everything measures
                     ;;   total elapsed time. (Okay, it could be negative if a called
                     ;;   metered function executes on a separate core.)
                     (maybe-atomic-incf (metering-exclusive-time stats) (the unsigned-byte
-                                                               (+ delta-time
-                                                                  metered-callee-time
-                                                                  )))
+                                                                            (+ delta-time
+                                                                               metered-callee-time
+                                                                               )))
                     
                     ; this is correct. If you just incremented *total-time*, the time of this body
                     ;   and the time taken by metered functions it calls would be counted twice.
                     (setf *total-time* (the unsigned-byte
                                             (+ prev-total-time delta-time)))
-                    
+                    (when (< *total-time* 0) (error "*total-time* is negative"))
                     ;; Consing
                     (maybe-atomic-incf (metering-inclusive-cons stats) (the unsigned-byte delta-cons))
                     ;; Similar story as above for exclusive consing
                     (maybe-atomic-incf (metering-exclusive-cons stats) (the unsigned-byte 
-                                                               (+ delta-cons
-                                                                  metered-callee-cons)))
+                                                                            (+ delta-cons
+                                                                               metered-callee-cons)))
                     (setf *total-cons* (the unsigned-byte 
                                             (+ prev-total-cons delta-cons)))
                     
@@ -449,15 +498,17 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;   metered functions called from body. Now we just have to add our own local overhead.
                     ; *actually, by the time body has finished.
                     (let ((my-overhead (the unsigned-byte
-                                            (- (get-time) 
+                                            (- (get-cpu-time) 
                                                start-time ; overall delta time for me and my local overhead
                                                (- (get-gctime) start-gctime) ; any gc time that happened since last get-gctime
                                                delta-time ; subtract out the non-overhead
                                                ))))
-                      
+                      (when (< my-overhead 0) (error "My-overhead is negative."))
                       (maybe-atomic-incf *total-overhead* my-overhead)
                       ; correct *total-time* to back out my overhead
-                      (maybe-atomic-incf *total-time* (- my-overhead))))))
+                      ;;; NO!!! *total-time* already has overhead backed out. If you do this, you're backing it out a second time.
+                      ;(maybe-atomic-incf *total-time* (- my-overhead))
+                    ))))
       (if method-p
           (lambda (&method saved-method &rest arglist)
             (declare (dynamic-extent arglist))
@@ -466,12 +517,19 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                                                               (symbol-function def)
                                                               arglist)
                (post-tally))))
+          #+CCL
           (lambda (&rest arglist)
             (declare (dynamic-extent arglist))
             (initial-lets
              (multiple-value-prog1 (apply (symbol-function def) arglist)
-               (post-tally))
-             ))))))
+               (post-tally))))
+          #+LISPWORKS
+          (lambda (original-fn &rest arglist)
+            (declare (dynamic-extent arglist))
+            (initial-lets
+             (multiple-value-prog1 (apply original-fn arglist)
+               (post-tally))))
+          ))))
  
 (defun reset-metering-info (spec)
   (%reset-metering-info (get-metering-stats spec)))
@@ -486,6 +544,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   
 (defun reset-all-metering () 
   "Reset metering info for all functions."
+  #+LISPWORKS (hcl::start-gc-timing :initialize t)
   (setf *total-time* 0
         *total-cons* 0
         *total-calls* 0
@@ -503,6 +562,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
              *metering-table*)
     result))
 
+#+CCL
 (defun meter (function &key define-if-not)
   "Accepts same function syntax as advise (except this is a function, not a macro, so you need to quote
     the arg)."
@@ -514,14 +574,24 @@ It's still likely that *total-time* and overhead calculations will be bogus here
       (advise-2 newdef newsym method-p function :meter :meter ; when and name are :meter
                  define-if-not)))
 
+
+#+LISPWORKS
+(defun meter (fnspec)
+  (let* ((newdef (meter-global-def fnspec nil nil)))
+    (eval `(defadvice (,fnspec :METER :around) (&rest args)
+      (apply ,newdef #'lw:call-next-advice args)))))
+
+#+CCL
 (defun uncanonicalize-specializer (specializer)
   (etypecase specializer
     (class (class-name specializer))
     (eql-specializer (list 'eql (eql-specializer-object specializer)))))
 
+#+CCL
 (defun pretty-class-name (method-specializer)
   (uncanonicalize-specializer method-specializer))
 
+#+CCL
 (defun prettify-method (method)
   "Returns a list of the form (:method ...) which is suitable for input to advice, trace, or meter."
   `(:method ,(method-name method)
@@ -532,6 +602,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 (defun get-methods (generic-function)
   (generic-function-methods generic-function))
 
+#+CCL
 (defun meter* (function &key define-if-not)
   "Like meter but if function is a GF, it meters all its methods extant at the time and
    does not meter the GF itself."
