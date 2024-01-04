@@ -318,7 +318,9 @@
 
 #+CCL
 (defmacro get-gctime ()
-  `(* gc-time-conversion-factor (gctime)))
+  `(* gc-time-conversion-factor (gctime)) ;;; this is wall clock time
+  0
+  )
 
 #+LISPWORKS ; only valid after #'hcl::start-gc-timing has been called and before #'hcl::stop-gc-timing has been called.
 (defmacro get-gctime ()
