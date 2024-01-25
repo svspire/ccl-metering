@@ -1,23 +1,23 @@
-;;; LW-metering.lisp
+;;; CL-metering.lisp
 ;;; Shannon Spires 08-Mar-2022
 
-;;;   Also see https://gitlab.common-lisp.net/dkochmanski/metering.
+;;; Also see https://gitlab.common-lisp.net/dkochmanski/metering.
 
-;;; Tools for metering lisp functions and methods in Lispworks. (Should still work in CCL too.)
-;;; NOTE: This records wall-clock time in microseconds, while the CCL version records CPU time in microseconds.
+;;; Tools for metering lisp functions in CCL, Lispworks, and maybe SBCL (untested in SBCL as yet).
+
 ;;; Based on CCL-metering.lisp
 
 ;;; This code also has the very useful feature that it enables one to meter individual
-;;;   methods of a generic function separately, where MK's does not.
+;;;   methods of a generic function separately, where MK's does not. (This feature only works in CCL.)
 ;;;   (Of course, metering regular functions is also still supported).
 
 ;;; This operates by essentially wrapping some advice around each metered method or function.
-;;; The function #'meter accepts the same syntax as #'advise except it takes fewer args
+;;; The function #'meter accepts the same syntax as #'advise [in CCL] except it takes fewer args
 ;;;   since it already knows precisely what extra work it needs to do before and after the nominal
 ;;;   function.
 ;;; The function #'meter* works just like #'meter except when you give it a symbol referring to a
-;;;   generic function it automatically calls #'meter on all its methods.
-;;; The main user interface is #'with-metering.
+;;;   generic function it automatically calls #'meter on all its methods. (This feature only works in CCL.)
+;;; The main user interface is #'with-metering or #'with-metering* (CCL only) if you want an individual method breakdown.
 
 ;;; This code works better on a 64-bit Common Lisp than 32-bit. If (* 1000000 (get-universal-time)) can't fit into a fixnum, it will have significant overhead.
 
@@ -829,6 +829,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
          (report-metering :all ,nested ,threshold ,key :ignore-no-calls)))
      (unmeter t)))
 
+#+CLOZURE ; only works with CCL for now
 (defmacro WITH-METERING* ((&rest functions)
                             (&optional (nested :exclusive) 
                                        (threshold 0.00)
