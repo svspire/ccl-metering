@@ -19,12 +19,16 @@
 ;;;   generic function it automatically calls #'meter on all its methods.
 ;;; The main user interface is #'with-metering.
 
+;;; This code works better on a 64-bit Common Lisp than 32-bit. If (* 1000000 (get-universal-time)) can't fit into a fixnum, it will have significant overhead.
+
 ;;; See examples at the end.
 
-(in-package #+CCL :ccl #-CCL :cl-user)
+(in-package :cl-user)
 
 (export '(meter unmeter meter* with-metering with-metering* report-metering reset-all-metering
           metered-functions meter-all meter-form))
+
+(defconstant +million+ 1000000)
 
 (defvar *TOTAL-TIME* 0
   "Total amount of time metered so far.")
@@ -46,10 +50,21 @@
 (defvar *metering-table*
   (make-hash-table :test #'equal))
 
-(defparameter metering-time-units-per-second 1000000)
+(defparameter metering-time-units-per-second +million+)
 (defparameter gc-time-conversion-factor (/ metering-time-units-per-second internal-time-units-per-second))
+(defparameter *use-wall-time* nil "True for CPU time; nil if you need wall time")
 
-;;; NB: This is wall clock time! It's not comparable to %internal-microsecond-run-time!
+#+OPENMCL
+(defun get-wall-time-usec ()
+  "This might or might not be actual wall clock time, but it's guaranteed monotonic. That's all we need."
+  (declare (optimize (speed 3) (debug 0)))
+  (ccl:rlet ((now :timeval)
+         (since :timeval))
+    (#_gettimeofday now (ccl:%null-ptr))
+    (ccl::%sub-timevals since now ccl::*lisp-start-timeval*)
+    (+ (* +million+ (the (unsigned-byte 32) (ccl:pref since :timeval.tv_sec)))
+       (the fixnum (ccl:pref since :timeval.tv_usec)))))
+
 ;;; From David McClain, who may have gotten it from https://gitlab.common-lisp.net/dkochmanski/metering
 #+(AND :LISPWORKS (OR :LINUX :MACOSX))
 (PROGN
@@ -66,12 +81,17 @@
 		:nelems 2
 		:fill   0)))
 	 (if (zerop (_get-time-of-day arr fli:*null-pointer*))
-             (+ (* 1000000 (the integer (fli:dereference arr :index 0)))
+             (+ (* +million+ (the integer (fli:dereference arr :index 0)))
                 (the integer (fli:dereference arr :index 1)))
            (error "Can't perform Posix gettimeofday()"))
 	 ))))
 
-#-CCL ; do nothing with #> sequences
+#+SBCL
+(defmacro get-wall-time-usec ()
+  (multiple-value-bind (secs usecs) (sb-ext:get-time-of-day)
+    (+ (* +million+ secs) usecs)))
+
+#-CLOZURE ; do nothing with #> sequences
 (set-dispatch-macro-character
  #\# #\>
  (lambda (stream char arg)
@@ -80,7 +100,7 @@
         (read stream nil nil nil)
         nil)))
 
-#-CCL ; do nothing with #_ sequences
+#-CLOZURE ; do nothing with #_ sequences
 (set-dispatch-macro-character
  #\# #\_
  (lambda (stream char arg)
@@ -90,21 +110,20 @@
         nil)))
 
 ; Can't use %internal-run-time because its resolution is dependent on internal-time-units-per-second. This one is not.
-#+CCL
+#+CLOZURE
 (defun %internal-microsecond-run-time ()
   ;; Returns user and system times in microseconds as multiple values. This is strictly CPU time, not wall clock time.
   #-windows-target
   (rlet ((usage :rusage))
-    (%%rusage usage)
+    (ccl::%%rusage usage)
     (let* ((user-seconds (pref usage :rusage.ru_utime.tv_sec))
            (system-seconds (pref usage :rusage.ru_stime.tv_sec))
            (user-micros (pref usage :rusage.ru_utime.tv_usec))
            (system-micros (pref usage :rusage.ru_stime.tv_usec)))
-      (values (+ (* user-seconds 1000000)
-                 (round user-micros 1))
-              (+ (* system-seconds 1000000)
-                 (round system-micros 1)))))
-  #+windows-target
+      (values (+ (* +million+ (+ user-seconds system-seconds))
+                 user-micros
+                 system-micros))))
+   #+windows-target
   (rlet ((start #>FILETIME)
          (end #>FILETIME)
          (kernel #>FILETIME)
@@ -119,10 +138,48 @@
            (convert 1))
       (values (floor user-100ns convert) (floor kernel-100ns convert)))))
 
-#+CCL
+#+CLOZURE
 (defun microsecond-run-time ()
   (multiple-value-bind (user sys) (%internal-microsecond-run-time)
     (+ user sys)))
+
+#+IGNORE ;;#+SBCL ;; NDY but this is SBCL's definition of system-internal-run-time
+(defun system-internal-run-time ()
+    (multiple-value-bind (ignore utime-sec utime-usec stime-sec stime-usec)
+        (unix-fast-getrusage rusage_self)
+      (declare (ignore ignore)
+               (type unsigned-byte utime-sec stime-sec)
+               ;; (Classic CMU CL had these (MOD 1000000) instead, but
+               ;; at least in Linux 2.2.12, the type doesn't seem to
+               ;; be documented anywhere and the observed behavior is
+               ;; to sometimes return 1000000 exactly.)
+               (type fixnum utime-usec stime-usec))
+      (let ((result (+ (* (+ utime-sec stime-sec)
+                          internal-time-units-per-second)
+                       (floor (+ utime-usec
+                                 stime-usec
+                                 (floor micro-seconds-per-internal-time-unit 2))
+                              micro-seconds-per-internal-time-unit))))
+        result)))
+
+#+SBCL
+(defun system-internal-microsecond-run-time ()
+    (multiple-value-bind (ignore utime-sec utime-usec stime-sec stime-usec)
+        (unix-fast-getrusage rusage_self)
+      (declare (ignore ignore)
+               (type unsigned-byte utime-sec stime-sec)
+               ;; (Classic CMU CL had these (MOD 1000000) instead, but
+               ;; at least in Linux 2.2.12, the type doesn't seem to
+               ;; be documented anywhere and the observed behavior is
+               ;; to sometimes return 1000000 exactly.)
+               (type fixnum utime-usec stime-usec))
+      (let ((result (+ (* (+ utime-sec stime-sec)
+                          +million+)
+                       (floor (+ utime-usec
+                                 stime-usec
+                                 (floor micro-seconds-per-internal-time-unit 2))
+                              micro-seconds-per-internal-time-unit))))
+        result)))
 
 (defstruct (metering)
   (inclusive-time 0) ; time in metering-time-units-per-second
@@ -287,11 +344,10 @@
         (setf beginning-of-column end-of-column)))))
 
 ; #'get-cpu-time returns total CPU runtime (system+user) in microseconds
-#+CCL
+#+CLOZURE
 (defmacro get-cpu-time ()
   `(the unsigned-byte (microsecond-run-time)))
 
-#+LISPWORKS
 (defmacro get-wall-time () ; wall clock time in case we need it
   `(the unsigned-byte (get-wall-time-usec)))
 
@@ -299,9 +355,9 @@
 (defmacro get-cpu-time ()
   `(the unsigned-byte
         (let ((times (system::get-cpu-times)))
-          (+ (* 1000000 (slot-value times 'system::user-secs))
+          (+ (* +million+ (slot-value times 'system::user-secs))
              (slot-value times 'system::user-micros)
-             (* 1000000 (slot-value times 'system::system-secs))
+             (* +million+ (slot-value times 'system::system-secs))
              (slot-value times 'system::system-micros)))))
 |#  
   
@@ -311,12 +367,12 @@
   `(the unsigned-byte
         (let ((times (system::get-cpu-times)))
           (declare (dynamic-extent times))
-          (+ (* 1000000 (+ (slot-value times 'system::user-secs)
+          (+ (* +million+ (+ (slot-value times 'system::user-secs)
                            (slot-value times 'system::system-secs)))
              (slot-value times 'system::user-micros)
              (slot-value times 'system::system-micros)))))
 
-#+CCL
+#+CLOZURE
 (defmacro get-gctime ()
   `(* gc-time-conversion-factor (gctime)) ;;; this is wall clock time
   0
@@ -324,11 +380,11 @@
 
 #+LISPWORKS ; only valid after #'hcl::start-gc-timing has been called and before #'hcl::stop-gc-timing has been called.
 (defmacro get-gctime ()
-  ;;;(truncate (* 1000000 (getf (hcl::get-gc-timing) :total))) ;;; NDY this appears to be wall clock time and thus cannot be compared with cpu time
+  ;;;(truncate (* +million+ (getf (hcl::get-gc-timing) :total))) ;;; NDY this appears to be wall clock time and thus cannot be compared with cpu time
   0)
   
 
-#+CCL
+#+CLOZURE
 (defmacro get-cons ()
   `(the unsigned-byte (ccl::total-bytes-allocated)))
 
@@ -336,6 +392,11 @@
 (defmacro get-cons ()
   (getf (() :TOTAL-ALLOCATED)) ; this conses a lot which kinda defeats the purpose
 |#
+
+(defmacro get-microseconds ()
+  (if *use-wall-time*
+      (get-wall-time)
+      (get-cpu-time)))
 
 #+LISPWORKS
 (defmacro get-cons ()
@@ -349,7 +410,7 @@
 (defun (setf get-metering-stats) (value spec)
   (setf (gethash spec *metering-table*) value))
 
-#+CCL
+#+CLOZURE
 (defun %unmeter-all ()
   (unadvise t :when :meter :name :meter)
   ; (unadvise t) [without other qualifiers] will remove all metering as well as all other advice
@@ -363,11 +424,11 @@
       (lw:remove-advice spec :METER)))
   (clrhash *metering-table*))
 
-#+CCL
+#+CLOZURE
 (defun unmeter (function)
   "(unmeter t) will remove all metering advice"
   (cond ((neq function t)
-         (%unadvise-1 function :METER :METER))
+         (ccl::%unadvise-1 function :METER :METER))
         (t (%unmeter-all))))
 
 #+LISPWORKS
@@ -430,12 +491,12 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 ; Only svn versions 16532 and later have atomic-incf functions fixed to work with structure refs
 ;  Except release 1.11.5 omitted that patch. So test for the functionality itself.
 
-#+CCL
+#+CLOZURE
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defstruct (foostruct)
     (slot1 0))
   (let ((foo (make-foostruct)))
-    (declare (ignore-if-unused foo))
+    (declare (ignorable foo))
     (ignore-errors
      (macroexpand `(atomic-incf-decf (foostruct-slot1 foo) 1))
      (pushnew :atomicity *features*))))
@@ -446,15 +507,15 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   )
 
 (defmacro maybe-atomic-incf (place delta)
-  #+(and CCL atomicity)
+  #+(and CLOZURE atomicity)
   `(atomic-incf-decf ,place ,delta)
   #+LISPWORKS
   `(sys:atomic-incf ,place ,delta)
-  #-(or (and CCL atomicity) LISPWORKS) ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
+  #-(or (and CLOZURE atomicity) LISPWORKS) ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
   `(incf ,place ,delta))
 
 (defun meter-global-def (function-spec def &optional method-p)
-  #-CCL (setf method-p nil) ; this feature only works in CCL
+  #-CLOZURE (setf method-p nil) ; this feature only works in CCL
   (let ((stats (make-metering)))
     (setf (get-metering-stats function-spec) stats)
     (macrolet ((initial-lets (&body body)
@@ -462,7 +523,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                  `(let ((prev-total-time *total-time*)
                         (prev-total-cons *total-cons*)
                         (prev-total-calls *total-calls*)
-                        (start-time (get-cpu-time))
+                        (start-time (get-microseconds))
                         (start-gctime (get-gctime))
                         (start-cons (get-cons)))
                     (declare (type unsigned-byte prev-total-time)
@@ -474,7 +535,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ,@body))
                (post-tally ()
                  ; would be nice if this could be atomic
-                 `(let ((delta-time (- (get-cpu-time) start-time (- (get-gctime) start-gctime)))
+                 `(let ((delta-time (- (get-microseconds) start-time (- (get-gctime) start-gctime)))
                         (delta-cons (- (get-cons) start-cons))
                         (metered-callee-time (- prev-total-time *total-time*)) ; always negative or 0
                         (metered-callee-cons (- prev-total-cons *total-cons*)) ; always negative or 0
@@ -533,7 +594,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                     ;   metered functions called from body. Now we just have to add our own local overhead.
                     ; *actually, by the time body has finished.
                     (let ((my-cpu-overhead (the unsigned-byte
-                                            (- (get-cpu-time) 
+                                            (- (get-microseconds) 
                                                start-time ; overall delta time for me and my local overhead
                                                (- (get-gctime) start-gctime) ; any gc time that happened since last get-gctime
                                                delta-time ; subtract out the non-overhead
@@ -557,7 +618,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                                                               (symbol-function def)
                                                               arglist)
                (post-tally))))
-          #+CCL
+          #+CLOZURE
           (lambda (&rest arglist)
             (declare (dynamic-extent arglist))
             (initial-lets
@@ -603,7 +664,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
              *metering-table*)
     result))
 
-#+CCL
+#+CLOZURE
 (defun meter (function &key define-if-not)
   "Accepts same function syntax as advise (except this is a function, not a macro, so you need to quote
     the arg)."
@@ -622,17 +683,17 @@ It's still likely that *total-time* and overhead calculations will be bogus here
     (eval `(defadvice (,fnspec :METER :around) (&rest args)
       (apply ,newdef #'lw:call-next-advice args)))))
 
-#+CCL
+#+CLOZURE
 (defun uncanonicalize-specializer (specializer)
   (etypecase specializer
     (class (class-name specializer))
     (eql-specializer (list 'eql (eql-specializer-object specializer)))))
 
-#+CCL
+#+CLOZURE
 (defun pretty-class-name (method-specializer)
   (uncanonicalize-specializer method-specializer))
 
-#+CCL
+#+CLOZURE
 (defun prettify-method (method)
   "Returns a list of the form (:method ...) which is suitable for input to advice, trace, or meter."
   `(:method ,(method-name method)
@@ -643,7 +704,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 (defun get-methods (generic-function)
   (generic-function-methods generic-function))
 
-#+CCL
+#+CLOZURE
 (defun meter* (function &key define-if-not)
   "Like meter but if function is a GF, it meters all its methods extant at the time and
    does not meter the GF itself."
@@ -870,10 +931,18 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 
 ;;; EXAMPLES
 #|
-(with-metering (directory %path-cat %path-std-quotes  %unix-file-kind  ftd-ff-call-expand-function
-                           %ff-call  get-foreign-namestring  %read-dir  %new-directory-p  %open-dir
-                           %file*= %split-dir  %add-directory-result  %all-directories %stat
-                           %directory %files-in-directory %some-specific %one-wild %process-directory-result)
+(with-metering (directory ccl::%path-cat ccl::%path-std-quotes  ccl::%unix-file-kind  ccl::ftd-ff-call-expand-function
+                           ccl::%ff-call  ccl::get-foreign-namestring  ccl::%read-dir  ccl::%new-directory-p  ccl::%open-dir
+                           ccl::%file*= ccl::%split-dir  ccl::%add-directory-result  ccl::%all-directories ccl::%stat
+                           ccl::%directory ccl::%files-in-directory ccl::%some-specific ccl::%one-wild ccl::%process-directory-result)
                           (:exclusive 0.0)
                           (length (directory "ccl:**;*" :files t :directories nil :follow-links nil :include-emacs-lockfiles t)))
+
+(let ((*use-wall-time* t))
+(with-metering (directory ccl::%path-cat ccl::%path-std-quotes  ccl::%unix-file-kind  ccl::ftd-ff-call-expand-function
+                           ccl::%ff-call  ccl::get-foreign-namestring  ccl::%read-dir  ccl::%new-directory-p  ccl::%open-dir
+                           ccl::%file*= ccl::%split-dir  ccl::%add-directory-result  ccl::%all-directories ccl::%stat
+                           ccl::%directory ccl::%files-in-directory ccl::%some-specific ccl::%one-wild ccl::%process-directory-result)
+                          (:exclusive 0.0)
+                          (length (directory "ccl:**;*" :files t :directories nil :follow-links nil :include-emacs-lockfiles t))))
 |#
