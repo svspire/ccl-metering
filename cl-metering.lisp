@@ -120,8 +120,9 @@
            (system-seconds (pref usage :rusage.ru_stime.tv_sec))
            (user-micros (pref usage :rusage.ru_utime.tv_usec))
            (system-micros (pref usage :rusage.ru_stime.tv_usec)))
-      (values (+ (* +million+ (+ user-seconds system-seconds))
-                 user-micros
+      (values (+ (* user-seconds +million+
+                 user-micros))
+              (+ (* system-seconds +million+)
                  system-micros))))
    #+windows-target
   (rlet ((start #>FILETIME)
@@ -498,7 +499,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   (let ((foo (make-foostruct)))
     (declare (ignorable foo))
     (ignore-errors
-     (macroexpand `(atomic-incf-decf (foostruct-slot1 foo) 1))
+     (macroexpand `(ccl::atomic-incf-decf (foostruct-slot1 foo) 1))
      (pushnew :atomicity *features*))))
 
 #+LISPWORKS
@@ -508,7 +509,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
 
 (defmacro maybe-atomic-incf (place delta)
   #+(and CLOZURE atomicity)
-  `(atomic-incf-decf ,place ,delta)
+  `(ccl::atomic-incf-decf ,place ,delta)
   #+LISPWORKS
   `(sys:atomic-incf ,place ,delta)
   #-(or (and CLOZURE atomicity) LISPWORKS) ; counts could be slightly inaccurate or inconsistent here because we can't use atomic operations
@@ -611,13 +612,16 @@ It's still likely that *total-time* and overhead calculations will be bogus here
                       ;(maybe-atomic-incf *total-time* (- my-cpu-overhead))
                     ))))
       (if method-p
-          (lambda (&method saved-method &rest arglist)
+          #+CLOZURE
+          (lambda (ccl::&method saved-method &rest arglist)
             (declare (dynamic-extent arglist))
             (initial-lets
-             (multiple-value-prog1 (apply-with-method-context saved-method
+             (multiple-value-prog1  (ccl::apply-with-method-context saved-method
                                                               (symbol-function def)
                                                               arglist)
                (post-tally))))
+          #-CLOZURE
+          (error "Can't meter individual methods except in CCL")
           #+CLOZURE
           (lambda (&rest arglist)
             (declare (dynamic-extent arglist))
@@ -673,7 +677,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
          (method-p (or (typep function 'method) ; can this happen? You bet!
                        (and (consp function)(eq (car function) :method))))
          (newdef (meter-global-def function newsym method-p)))
-      (advise-2 newdef newsym method-p function :meter :meter ; when and name are :meter
+      (ccl::advise-2 newdef newsym method-p function :meter :meter ; when and name are :meter
                  define-if-not)))
 
 
@@ -709,7 +713,7 @@ It's still likely that *total-time* and overhead calculations will be bogus here
   "Like meter but if function is a GF, it meters all its methods extant at the time and
    does not meter the GF itself."
   (let ((gf nil))
-    (if (standard-generic-function-p (setf gf (fboundp function)))
+    (if (ccl::standard-generic-function-p (setf gf (fboundp function)))
       (let ((results '()))
          (flet ((meterit (x)
                 (meter x :define-if-not define-if-not)))
