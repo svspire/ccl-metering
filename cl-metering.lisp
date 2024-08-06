@@ -3,7 +3,11 @@
 
 ;;; Also see https://gitlab.common-lisp.net/dkochmanski/metering.
 
-;;; Tools for metering lisp functions in CCL, Lispworks, and maybe SBCL (untested in SBCL as yet).
+;;; Tools for metering lisp functions in CCL, Lispworks, and maybe eventually SBCL but not yet.
+
+;;; Note about SBCL: SBCL doesn't have an advice mechanism, but it does have an encapsulation mechanism.
+;;; Look at the source file #P"profile.lisp". That mechanism might be able to be adapted for use herein,
+;;; but I haven't done it yet.
 
 ;;; Based on CCL-metering.lisp
 
@@ -144,43 +148,13 @@
   (multiple-value-bind (user sys) (%internal-microsecond-run-time)
     (+ user sys)))
 
-#+IGNORE ;;#+SBCL ;; NDY but this is SBCL's definition of system-internal-run-time
-(defun system-internal-run-time ()
-    (multiple-value-bind (ignore utime-sec utime-usec stime-sec stime-usec)
-        (unix-fast-getrusage rusage_self)
-      (declare (ignore ignore)
-               (type unsigned-byte utime-sec stime-sec)
-               ;; (Classic CMU CL had these (MOD 1000000) instead, but
-               ;; at least in Linux 2.2.12, the type doesn't seem to
-               ;; be documented anywhere and the observed behavior is
-               ;; to sometimes return 1000000 exactly.)
-               (type fixnum utime-usec stime-usec))
-      (let ((result (+ (* (+ utime-sec stime-sec)
-                          internal-time-units-per-second)
-                       (floor (+ utime-usec
-                                 stime-usec
-                                 (floor micro-seconds-per-internal-time-unit 2))
-                              micro-seconds-per-internal-time-unit))))
-        result)))
+;; Modern versions of SBCL have internal-time-units-per-second of at least one million. No precision is lost here.
+#+SBCL
+(defvar *microsecond-conversion-factor* (/ +million+ internal-time-units-per-second))
 
 #+SBCL
 (defun system-internal-microsecond-run-time ()
-    (multiple-value-bind (ignore utime-sec utime-usec stime-sec stime-usec)
-        (unix-fast-getrusage rusage_self)
-      (declare (ignore ignore)
-               (type unsigned-byte utime-sec stime-sec)
-               ;; (Classic CMU CL had these (MOD 1000000) instead, but
-               ;; at least in Linux 2.2.12, the type doesn't seem to
-               ;; be documented anywhere and the observed behavior is
-               ;; to sometimes return 1000000 exactly.)
-               (type fixnum utime-usec stime-usec))
-      (let ((result (+ (* (+ utime-sec stime-sec)
-                          +million+)
-                       (floor (+ utime-usec
-                                 stime-usec
-                                 (floor micro-seconds-per-internal-time-unit 2))
-                              micro-seconds-per-internal-time-unit))))
-        result)))
+  (truncate (* (get-internal-run-time) *microsecond-conversion-factor*)))
 
 (defstruct (metering)
   (inclusive-time 0) ; time in metering-time-units-per-second
