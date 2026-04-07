@@ -1,0 +1,113 @@
+ccl-metering-notes.txt
+02-January-2024
+SVS
+
+delta-cons = (- (get-cons) start-cons), i.e.
+amount consed by the entire system during _this_ fn call. Always positive.
+Note that this will include consing by all functions that were called during this fn call,
+whether they be metered or not.
+
+prev-total-cons = *total-cons* just before fn call was run, i.e.
+this is consing
+
+*total-cons*[before fn call] = total consing recorded by metered functions 
+in this session before _this_ fn call.
+
+*total-cons*[after fn call] = (+ prev-total-cons delta-cons),
+i.e. *total-cons* before fn call was run plus total consed by _this_ fn call.
+
+*total-cons* thus represents overall total consed by metered functions 
+(and by unmetered functions nevertheless called) during this metering session.
+
+metered-callee-cons = (- prev-total-cons *total-cons*[after fn call]),
+i.e. it's the total amount by which *total-cons* was incremented in metered callees.
+It should always be less in magnitude than delta-cons but it's not in LW.
+
+metering-exclusive-cons = incremented by (+ delta-cons metered-callee-cons)
+
+(setf *total-cons* (the unsigned-byte (+ prev-total-cons delta-cons)))
+; the fact that this changes *total-cons* _without_ looking at current value of *total-cons* disturbs me.
+; Right now this is adding *total-cons*[before fn call] to delta-cons. And
+;   because delta-cons is _not_ exclusive, that means *total-cons* cannot be exclusive.
+
+(defun f1 () ; assume f1 itself is metered
+  (f2 )  ; unmetered
+  (f3 )  ; metered
+  (f4 )) ; unmetered
+
+metering-exclusive-cons[f1] should equal  delta-cons[f1] - delta-cons[f3].
+
+total-cons of the session should equal metering-exclusive-cons[f1] + delta-cons[f3], which
+in all cases should equal delta-cons[f1].
+
+The difficulty comes when one of f2, f3, or f4 calls some other metered function.
+There are 3 possibilities.
+1. Nobody calls another metered function, period. This is the trivial case.
+2. f2, f3, or f4 calls some other metered function but never one of {f1, f2, f3, f4} (i.e. there's no recursion)
+3. f2, f3, or f4 calls (directly or indirectly one or more of {f1, f2, f3, f4} (i.e. there is recursion)
+
+Case 1 is trivial and we don't need to do anything special to handle it. We'll talk about cases 2 and 3 in
+a minute.
+
+Let's introduce a concept called *total-metered-consing* which will keep track of all consing
+that happened when metered functions were called, but it does _not_ account for consing
+of unmetered functions like f2 and f4 above.
+
+What is *total-metered-consing* for f1?
+It's the same as delta-cons[f1] because f1 itself is metered. 
+
+In general, is it even possible to compute *total-metered-consing*?
+It's possible for f1 because in the case of f1, it's just delta-cons[f1].
+
+Let's assume we have a magic oracle that can tell us *total-metered-consing*[f3].
+Now we can get the "total-unmetered-consing" of f1 (as it were) by
+
+total-unmetered-consing[f1] = delta-cons[f1] - *total-metered-consing*[f3].
+
+But *total-metered-consing*[f3] = delta-cons[f3] because f3 is metered.
+
+So *total-metered-consing* is not really a useful concept, because it's always just
+the delta-cons of the outermost function.
+
+What _is_ useful (and needed) is total-consing-of-called-metered-functions[fx], where
+we assume fx is a metered function which may or may not call -- directly or indirectly --
+other metered functions.
+
+Can we compute total-consing-of-called-metered-functions[fx], where x is any metered function?
+That is, the total amount of consing of all functions that fx calls?
+
+Well, for f1 we've been assuming the existence of delta-cons[f3], which does the job.
+If all this does is compute delta-cons while f3 runs, and then adds it to some kind
+of running total, then that running total at the end of f3 -- minus whatever it was
+at the beginning of f3 -- is the answer we want. That's theoretically what *total-cons* is for.
+
+The tricky bit is figuring out whose job it is to update *total-cons* and what it means as
+some kind of invariant.
+
+The metering code does the following:
+1. Snapshots *total-cons* as prev-total-cons and the heap as start-cons.
+2. Runs the body of the metered function.
+3. Computes delta-cons as current-heap - start-cons.
+4. Looks at *total-cons* _again_ on the assumption that callees might have updated it.
+5. Sets metered-callee-cons to the amount *total-cons* grew.
+6. Sets *total-cons* to prev-total-cons + delta-cons for the benefit of anybody who
+called this metered function. Blowing away the old value of *total-cons* is okay here
+because by this time we have used it in step 4 and now our job is to report it back
+accurately to anybody who might have called _us_.
+
+So *total-cons* serves two purposes:
+1. During the tally process of a metered function, it records how much consing occurred during
+that function's metered callees, at any level of indirection... but _only_ to the depth at which
+the first metered function is found -- no deeper! Thus if f1 calls f2 and both are metered, then
+when f1 is tallying itself it will see the total consing done by f2. That is, it will see
+delta-cons[f2]. However, if f1 calls f2 which calls f3 and f2 is _not_ metered, then when f1
+tallies itself it will only see delta-cons[f3]. In the two scenarios just described, if f2 or
+f3 themselves (respectively) call _other_ metered functions (whether recursively or not), that's
+completely immaterial. The effect that calling f2 or f3 (respectively) has will always be 
+delta-cons[f2] or delta-cons[f3]. And delta-conses don't care about metering at all.
+
+2. When the metered function returns, it records the total consing of said metered function. This
+will include all consing that took place during the this metered function, whether by metered
+functions or not, and whether by this thread or not.
+
+ 
